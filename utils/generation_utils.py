@@ -24,6 +24,7 @@ from functools import partial
 from ast import literal_eval
 from typing import List, Dict, Any
 
+import httpx
 import aiofiles
 from PIL import Image
 from google import genai
@@ -579,10 +580,12 @@ async def call_openrouter_image_generation_with_retry_async(
     model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
 ):
     """
-    ASYNC: Call OpenRouter image generation via chat completions with modalities=["image"].
-    Images are returned in choices[0].message.images as data URLs.
+    ASYNC: Call OpenRouter image generation via direct httpx POST to avoid
+    openai SDK issues with extra_body dropping the model field.
+    Images are returned in choices[0].message.content as inline_data or
+    in choices[0].message.images as data URLs.
     """
-    if openrouter_client is None:
+    if not openrouter_api_key:
         raise RuntimeError(
             "OpenRouter client was not initialized: missing API key."
         )
@@ -595,33 +598,61 @@ async def call_openrouter_image_generation_with_retry_async(
     model_name = _to_openrouter_model_id(model_name)
     openai_contents = _convert_to_openai_format(contents)
 
+    image_config = {}
+    if aspect_ratio:
+        image_config["aspect_ratio"] = aspect_ratio
+    if image_size:
+        image_config["image_size"] = image_size
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": openai_contents},
+        ],
+        "temperature": temperature,
+        "modalities": ["image", "text"],
+    }
+    if image_config:
+        payload["image_config"] = image_config
+
+    headers = {
+        "Authorization": f"Bearer {openrouter_api_key}",
+        "Content-Type": "application/json",
+    }
+
     for attempt in range(max_attempts):
         try:
-            extra_body = {
-                "modalities": ["image", "text"],
-            }
-            if aspect_ratio or image_size:
-                extra_body["image_config"] = {}
-                if aspect_ratio:
-                    extra_body["image_config"]["aspect_ratio"] = aspect_ratio
-                if image_size:
-                    extra_body["image_config"]["image_size"] = image_size
+            async with httpx.AsyncClient(timeout=300) as client:
+                resp = await client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+            resp.raise_for_status()
+            data = resp.json()
 
-            response = await openrouter_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": openai_contents},
-                ],
-                temperature=temperature,
-                extra_body=extra_body,
-            )
+            choices = data.get("choices", [])
+            if not choices:
+                print(f"[Warning]: OpenRouter image generation returned no choices, retrying...")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(retry_delay)
+                continue
 
-            # Extract image from response.choices[0].message.images
-            message = response.choices[0].message
-            images = getattr(message, "images", None)
+            message = choices[0].get("message", {})
+
+            # Try extracting from inline_data in content (Gemini-style)
+            content = message.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and "inline_data" in part:
+                        b64_data = part["inline_data"].get("data", "")
+                        if b64_data:
+                            return [b64_data]
+
+            # Try extracting from images field (OpenRouter standard)
+            images = message.get("images")
             if images and len(images) > 0:
-                # images are dicts: {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}
                 img_item = images[0]
                 if isinstance(img_item, dict):
                     data_url = img_item.get("image_url", {}).get("url", "")
@@ -634,11 +665,31 @@ async def call_openrouter_image_generation_with_retry_async(
                 if b64_data:
                     return [b64_data]
 
+            # Try extracting base64 from text content
+            if isinstance(content, str) and content.startswith("data:image"):
+                if "," in content:
+                    b64_data = content.split(",", 1)[1]
+                    if b64_data:
+                        return [b64_data]
+
             print(f"[Warning]: OpenRouter image generation returned no images, retrying...")
             if attempt < max_attempts - 1:
                 await asyncio.sleep(retry_delay)
             continue
 
+        except httpx.HTTPStatusError as e:
+            context_msg = f" for {error_context}" if error_context else ""
+            current_delay = min(retry_delay * (2 ** attempt), 60)
+            print(
+                f"OpenRouter image gen attempt {attempt + 1} failed{context_msg}: "
+                f"HTTP {e.response.status_code} - {e.response.text}. "
+                f"Retrying in {current_delay}s..."
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(current_delay)
+            else:
+                print(f"Error: All {max_attempts} attempts failed{context_msg}")
+                return ["Error"]
         except Exception as e:
             context_msg = f" for {error_context}" if error_context else ""
             current_delay = min(retry_delay * (2 ** attempt), 60)
