@@ -75,6 +75,17 @@ else:
     print("Warning: Could not initialize OpenAI Client. Missing credentials.")
     openai_client = None
 
+openrouter_api_key = get_config_val("api_keys", "openrouter_api_key", "OPENROUTER_API_KEY", "")
+if openrouter_api_key:
+    openrouter_client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=openrouter_api_key,
+    )
+    print("Initialized OpenRouter Client with API Key")
+else:
+    print("Warning: Could not initialize OpenRouter Client. Missing credentials.")
+    openrouter_client = None
+
 
 
 def _convert_to_gemini_parts(contents: List[Dict[str, Any]]) -> List[types.Part]:
@@ -92,6 +103,14 @@ def _convert_to_gemini_parts(contents: List[Dict[str, Any]]) -> List[types.Part]
                     types.Part.from_bytes(
                         data=base64.b64decode(source["data"]),
                         mime_type=source["media_type"],
+                    )
+                )
+            elif "image_base64" in item:
+                # Shorthand format used by planner_agent
+                gemini_parts.append(
+                    types.Part.from_bytes(
+                        data=base64.b64decode(item["image_base64"]),
+                        mime_type="image/jpeg",
                     )
                 )
     return gemini_parts
@@ -224,8 +243,14 @@ def _convert_to_openai_format(contents: List[Dict[str, Any]]) -> List[Dict[str, 
             if source.get("type") == "base64":
                 media_type = source.get("media_type", "image/jpeg")
                 data = source.get("data", "")
-                # OpenAI expects data URL format
                 data_url = f"data:{media_type};base64,{data}"
+                openai_contents.append({
+                    "type": "image_url",
+                    "image_url": {"url": data_url}
+                })
+            elif "image_base64" in item:
+                # Shorthand format used by planner_agent
+                data_url = f"data:image/jpeg;base64,{item['image_base64']}"
                 openai_contents.append({
                     "type": "image_url",
                     "image_url": {"url": data_url}
@@ -454,3 +479,258 @@ async def call_openai_image_generation_with_retry_async(
                 return ["Error"]
 
     return ["Error"]
+
+
+async def call_openrouter_with_retry_async(
+    model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
+):
+    """
+    ASYNC: Call OpenRouter API (OpenAI-compatible) with asynchronous retry logic.
+    """
+    if openrouter_client is None:
+        raise RuntimeError(
+            "OpenRouter client was not initialized: missing API key. "
+            "Please set OPENROUTER_API_KEY in environment, or configure "
+            "api_keys.openrouter_api_key in configs/model_config.yaml."
+        )
+
+    model_name = _to_openrouter_model_id(model_name)
+    system_prompt = config["system_prompt"]
+    temperature = config["temperature"]
+    candidate_num = config["candidate_num"]
+    max_completion_tokens = config["max_completion_tokens"]
+    response_text_list = []
+
+    current_contents = contents
+
+    is_input_valid = False
+    for attempt in range(max_attempts):
+        try:
+            openai_contents = _convert_to_openai_format(current_contents)
+            first_response = await openrouter_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": openai_contents},
+                ],
+                temperature=temperature,
+                max_completion_tokens=max_completion_tokens,
+            )
+            content = first_response.choices[0].message.content or ""
+            if not content.strip():
+                print(f"OpenRouter returned empty content, retrying...")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(retry_delay)
+                continue
+            response_text_list.append(content)
+            is_input_valid = True
+            break
+
+        except Exception as e:
+            error_str = str(e).lower()
+            context_msg = f" for {error_context}" if error_context else ""
+            current_delay = min(retry_delay * (2 ** attempt), 60)
+            print(
+                f"OpenRouter attempt {attempt + 1} failed{context_msg}: {error_str}. "
+                f"Retrying in {current_delay}s..."
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(current_delay)
+
+    if not is_input_valid:
+        context_msg = f" for {error_context}" if error_context else ""
+        print(f"Error: All {max_attempts} OpenRouter attempts failed{context_msg}.")
+        return ["Error"] * candidate_num
+
+    remaining_candidates = candidate_num - 1
+    if remaining_candidates > 0:
+        valid_openai_contents = _convert_to_openai_format(current_contents)
+        tasks = [
+            openrouter_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": valid_openai_contents},
+                ],
+                temperature=temperature,
+                max_completion_tokens=max_completion_tokens,
+            )
+            for _ in range(remaining_candidates)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception):
+                print(f"Error generating a subsequent OpenRouter candidate: {res}")
+                response_text_list.append("Error")
+            else:
+                response_text_list.append(res.choices[0].message.content or "Error")
+
+    return response_text_list
+
+
+async def call_openrouter_image_generation_with_retry_async(
+    model_name, contents, config, max_attempts=5, retry_delay=30, error_context=""
+):
+    """
+    ASYNC: Call OpenRouter image generation via chat completions with modalities=["image"].
+    Images are returned in choices[0].message.images as data URLs.
+    """
+    if openrouter_client is None:
+        raise RuntimeError(
+            "OpenRouter client was not initialized: missing API key."
+        )
+
+    system_prompt = config.get("system_prompt", "")
+    temperature = config.get("temperature", 1.0)
+    aspect_ratio = config.get("aspect_ratio", "1:1")
+    image_size = config.get("image_size", "1k")
+
+    model_name = _to_openrouter_model_id(model_name)
+    openai_contents = _convert_to_openai_format(contents)
+
+    for attempt in range(max_attempts):
+        try:
+            extra_body = {
+                "modalities": ["image", "text"],
+            }
+            if aspect_ratio or image_size:
+                extra_body["image_config"] = {}
+                if aspect_ratio:
+                    extra_body["image_config"]["aspect_ratio"] = aspect_ratio
+                if image_size:
+                    extra_body["image_config"]["image_size"] = image_size
+
+            response = await openrouter_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": openai_contents},
+                ],
+                temperature=temperature,
+                extra_body=extra_body,
+            )
+
+            # Extract image from response.choices[0].message.images
+            message = response.choices[0].message
+            images = getattr(message, "images", None)
+            if images and len(images) > 0:
+                # images are dicts: {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,...'}}
+                img_item = images[0]
+                if isinstance(img_item, dict):
+                    data_url = img_item.get("image_url", {}).get("url", "")
+                else:
+                    data_url = str(img_item)
+                if "," in data_url:
+                    b64_data = data_url.split(",", 1)[1]
+                else:
+                    b64_data = data_url
+                if b64_data:
+                    return [b64_data]
+
+            print(f"[Warning]: OpenRouter image generation returned no images, retrying...")
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(retry_delay)
+            continue
+
+        except Exception as e:
+            context_msg = f" for {error_context}" if error_context else ""
+            current_delay = min(retry_delay * (2 ** attempt), 60)
+            print(
+                f"OpenRouter image gen attempt {attempt + 1} failed{context_msg}: {e}. "
+                f"Retrying in {current_delay}s..."
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(current_delay)
+            else:
+                print(f"Error: All {max_attempts} attempts failed{context_msg}")
+                return ["Error"]
+
+    return ["Error"]
+
+
+def _to_openrouter_model_id(model_name: str) -> str:
+    """Convert a bare model name to OpenRouter format (provider/model).
+
+    OpenRouter requires model IDs like 'google/gemini-3-pro-preview'.
+    If the name already contains '/', assume it's already qualified.
+    Otherwise, prefix with 'google/' for Gemini models.
+    """
+    if "/" in model_name:
+        return model_name
+    if model_name.startswith("gemini"):
+        return f"google/{model_name}"
+    return model_name
+
+
+async def call_model_with_retry_async(
+    model_name, contents, config, max_attempts=5, retry_delay=5, error_context=""
+):
+    """
+    Unified router that dispatches to the correct provider based on model_name.
+
+    Routing rules:
+      1. Explicit prefix overrides: "openrouter/" -> OpenRouter, "claude-" -> Anthropic,
+         "gpt-"/"o1-"/"o3-"/"o4-" -> OpenAI
+      2. No prefix: auto-detect based on which API key is configured.
+         Priority: OpenRouter > Gemini > Anthropic > OpenAI
+    """
+    # Explicit provider prefix overrides auto-detection
+    if model_name.startswith("openrouter/"):
+        provider = "openrouter"
+        actual_model = model_name[len("openrouter/"):]
+    elif model_name.startswith("claude-"):
+        provider = "anthropic"
+        actual_model = model_name
+    elif any(model_name.startswith(p) for p in ("gpt-", "o1-", "o3-", "o4-")):
+        provider = "openai"
+        actual_model = model_name
+    else:
+        # Auto-detect provider based on which API key is configured
+        actual_model = model_name
+        if openrouter_client is not None:
+            provider = "openrouter"
+            actual_model = _to_openrouter_model_id(model_name)
+        elif gemini_client is not None:
+            provider = "gemini"
+        elif anthropic_client is not None:
+            provider = "anthropic"
+        elif openai_client is not None:
+            provider = "openai"
+        else:
+            raise RuntimeError(
+                "No API client available. Please configure at least one API key "
+                "in configs/model_config.yaml or via environment variables."
+            )
+
+    if provider == "gemini":
+        return await call_gemini_with_retry_async(
+            model_name=actual_model,
+            contents=contents,
+            config=config,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            error_context=error_context,
+        )
+
+    # Convert Gemini GenerateContentConfig -> dict for OpenAI/Claude/OpenRouter
+    cfg_dict = {
+        "system_prompt": config.system_instruction if hasattr(config, "system_instruction") else "",
+        "temperature": config.temperature if hasattr(config, "temperature") else 1.0,
+        "candidate_num": config.candidate_count if hasattr(config, "candidate_count") else 1,
+        "max_completion_tokens": config.max_output_tokens if hasattr(config, "max_output_tokens") else 50000,
+    }
+
+    call_fn = {
+        "openrouter": call_openrouter_with_retry_async,
+        "anthropic": call_claude_with_retry_async,
+        "openai": call_openai_with_retry_async,
+    }[provider]
+
+    return await call_fn(
+        model_name=actual_model,
+        contents=contents,
+        config=cfg_dict,
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+        error_context=error_context,
+    )
