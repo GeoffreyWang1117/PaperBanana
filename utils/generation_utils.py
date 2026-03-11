@@ -174,8 +174,9 @@ async def call_gemini_with_retry_async(
                     part.text
                     for candidate in response.candidates
                     for part in candidate.content.parts
+                    if part.text is not None
                 ]
-            result_list.extend([r for r in raw_response_list if r.strip() != ""])
+            result_list.extend([r for r in raw_response_list if r and r.strip() != ""])
             if len(result_list) >= target_candidate_count:
                 result_list = result_list[:target_candidate_count]
                 break
@@ -376,7 +377,13 @@ async def call_openai_with_retry_async(
                 max_completion_tokens=max_completion_tokens,
             )
             # If we reach here, the input is valid.
-            response_text_list.append(first_response.choices[0].message.content)
+            content = first_response.choices[0].message.content or ""
+            if not content.strip():
+                print(f"OpenAI returned empty content, retrying...")
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(retry_delay)
+                continue
+            response_text_list.append(content)
             is_input_valid = True
             break  # Exit the validation loop
 
@@ -422,7 +429,7 @@ async def call_openai_with_retry_async(
                 print(f"Error generating a subsequent candidate: {res}")
                 response_text_list.append("Error")
             else:
-                response_text_list.append(res.choices[0].message.content)
+                response_text_list.append(res.choices[0].message.content or "Error")
 
     return response_text_list
 
