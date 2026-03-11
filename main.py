@@ -77,10 +77,10 @@ async def main():
         help="maximum number of critic rounds (default: 3)",
     )
     parser.add_argument(
-        "--model_name",
+        "--main_model_name",
         type=str,
         default="",
-        help="model name to use (default: "")",
+        help="main model name to use (default: "")",
     )
     args = parser.parse_args()
 
@@ -91,7 +91,7 @@ async def main():
         exp_mode=args.exp_mode,
         retrieval_setting=args.retrieval_setting,
         max_critic_rounds=args.max_critic_rounds,
-        model_name=args.model_name,
+        main_model_name=args.main_model_name,
         work_dir=Path(__file__).parent,
     )
     

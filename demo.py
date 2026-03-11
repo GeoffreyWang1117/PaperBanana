@@ -128,7 +128,7 @@ def create_sample_inputs(method_content, caption, diagram_type="Pipeline", aspec
     
     return inputs
 
-async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", retrieval_setting="auto", model_name=""):
+async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", retrieval_setting="auto", main_model_name="", image_gen_model_name=""):
     """Process multiple candidates in parallel using PaperVizProcessor."""
     # Create experiment config
     exp_config = config.ExpConfig(
@@ -136,7 +136,8 @@ async def process_parallel_candidates(data_list, exp_mode="dev_planner_critic", 
         split_name="demo",
         exp_mode=exp_mode,
         retrieval_setting=retrieval_setting,
-        model_name=model_name,
+        main_model_name=main_model_name,
+        image_gen_model_name=image_gen_model_name,
         work_dir=Path(__file__).parent,
     )
     
@@ -207,7 +208,7 @@ async def refine_image_with_nanoviz(image_bytes, edit_prompt, aspect_ratio="21:9
         )
         
         # Generate refined image
-        image_model = get_config_val("defaults", "image_model_name", "IMAGE_MODEL_NAME", "")
+        image_model = get_config_val("defaults", "image_gen_model_name", "IMAGE_GEN_MODEL_NAME", "")
         response = await asyncio.to_thread(
             client.models.generate_content,
             model=image_model,
@@ -388,7 +389,7 @@ def main():
             
             exp_mode = st.selectbox(
                 "Pipeline Mode",
-                ["demo_planner_critic", "demo_full"],
+                ["demo_full", "demo_planner_critic"],
                 index=0,
                 key="tab1_exp_mode",
                 help="Select which agent pipeline to use"
@@ -433,16 +434,53 @@ def main():
                 help="Maximum number of critic refinement iterations"
             )
             
-            default_model = get_config_val("defaults", "model_name", "MODEL_NAME", "YOUR_MODEL_NAME_HERE")
-            options = ["", default_model] if default_model else ["", "YOUR_MODEL_NAME_HERE"]
-            
-            model_name = st.selectbox(
-                "Model Name",
-                options,
+            default_model = get_config_val("defaults", "main_model_name", "MAIN_MODEL_NAME", "gemini-3.1-pro-preview")
+            text_model_presets = [default_model] if default_model else ["gemini-3.1-pro-preview"]
+            if "gemini-3-flash-preview" not in text_model_presets:
+                text_model_presets.append("gemini-3-flash-preview")
+            if "gemini-3.1-pro-preview" not in text_model_presets:
+                text_model_presets.insert(0, "gemini-3.1-pro-preview")
+            text_model_presets.append("Custom")
+            text_model_selection = st.selectbox(
+                "Main Model Name",
+                text_model_presets,
                 index=0,
                 key="tab1_model_name",
-                help="Model name to use for reasoning"
+                help="Vision-language model for understanding and describing diagrams"
             )
+            if text_model_selection == "Custom":
+                main_model_name = st.text_input(
+                    "Custom Main Model",
+                    value="",
+                    key="tab1_main_model_name_custom",
+                    placeholder="e.g., openrouter/google/gemini-3.1-pro"
+                )
+            else:
+                main_model_name = text_model_selection
+
+            default_image_model = get_config_val("defaults", "image_gen_model_name", "IMAGE_GEN_MODEL_NAME", "gemini-3.1-flash-image-preview")
+            image_model_presets = [default_image_model] if default_image_model else ["gemini-3.1-flash-image-preview"]
+            if "gemini-3-pro-image-preview" not in image_model_presets:
+                image_model_presets.append("gemini-3-pro-image-preview")
+            if "gemini-3.1-flash-image-preview" not in image_model_presets:
+                image_model_presets.insert(0, "gemini-3.1-flash-image-preview")
+            image_model_presets.append("Custom")
+            image_model_selection = st.selectbox(
+                "Image Generation Model Name",
+                image_model_presets,
+                index=0,
+                key="tab1_image_model_name",
+                help="Model for generating diagram images"
+            )
+            if image_model_selection == "Custom":
+                image_gen_model_name = st.text_input(
+                    "Custom Image Generation Model",
+                    value="",
+                    key="tab1_image_gen_model_name_custom",
+                    placeholder="e.g., openrouter/openai/gpt-image-1"
+                )
+            else:
+                image_gen_model_name = image_model_selection
         
         st.divider()
         
@@ -570,10 +608,11 @@ The framework extends to statistical plots by adjusting the Visualizer and Criti
                     # Process in parallel
                     try:
                         results = asyncio.run(process_parallel_candidates(
-                            input_data_list, 
-                            exp_mode=exp_mode, 
+                            input_data_list,
+                            exp_mode=exp_mode,
                             retrieval_setting=retrieval_setting,
-                            model_name=model_name
+                            main_model_name=main_model_name,
+                            image_gen_model_name=image_gen_model_name
                         ))
                         st.session_state["results"] = results
                         st.session_state["exp_mode"] = exp_mode
