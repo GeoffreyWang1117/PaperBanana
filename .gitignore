@@ -6,3 +6,11 @@ __pycache__/
 .venv/
 data/
 results/
+
+# Local-only personal figure scripts, generated images, and per-machine config
+private/
+/*.png
+/*.jpg
+/*.jpeg
+CLAUDE.md
+.claude/

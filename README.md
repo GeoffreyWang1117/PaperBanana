@@ -2,6 +2,58 @@
 <div align="center">Dawei Zhu, Rui Meng, Yale Song, Xiyu Wei, Sujian Li, Tomas Pfister and Jinsung yoon
 <br><br></div>
 
+---
+
+## Fork Notes (GeoffreyWang1117)
+
+> Personal fork of [dwzhu-pku/PaperBanana](https://github.com/dwzhu-pku/PaperBanana) with Claude Code skill integration, environment hardening, and per-project figure generation scripts. Synced with upstream at [`fed1812`](https://github.com/dwzhu-pku/PaperBanana/commit/fed1812).
+
+### What this fork adds
+
+**Claude Code Skill Integration**
+- `/generate-figure` global command (`~/.claude/commands/generate-figure.md`) — invoke PaperBanana from any project directory in Claude Code
+- Pre-flight checks: validates venv activation + API key presence before running the 5–15 min pipeline
+- Enforces `source .venv/bin/activate` before every `python skill/run.py` call (matches vectorize / edit-banana convention)
+- Sensible ad-hoc defaults: `--num-candidates 2`, `--max-critic-rounds 2`, `--retrieval-setting none` (upstream defaults 10/3/auto are tuned for benchmarking, not interactive use)
+
+**Environment & Config Fixes**
+- Fixed `model_config.yaml` field names: `model_name` → `main_model_name`, `image_model_name` → `image_gen_model_name` (required after upstream refactored `ExpConfig`)
+- Updated default image model to `gemini-3.1-flash-image-preview`
+- Corrected misplaced OpenAI API key (was in `anthropic_api_key` field)
+
+**Project Organization**
+- `private/` directory (gitignored) — 35 per-project figure generation scripts (`run_*.py`, `gen_*.py`, `refine_*.py`) and generated images
+- `.gitignore` additions: `private/`, root-level `*.png`/`*.jpg`, `CLAUDE.md`, `.claude/`
+- Removed broken local `generate.py` (used deleted `model_name` field); all CLI usage now goes through upstream's `skill/run.py`
+
+**Documentation**
+- `CLAUDE.md` updated: references `skill/run.py` (not deleted `generate.py`), documents venv activation requirement, lists correct config field names, removes obsolete local-patch notes
+
+### Test results
+
+Tested on **Infer-GC** (RTSS 2026 paper: "Deterministic Memory Reclamation for Real-Time LLM Inference on Edge Devices"):
+
+| Run | Candidates | Critic Rounds | Time | Success Rate | Best Score |
+|-----|-----------|---------------|------|-------------|------------|
+| v1 | 2 | 2 | ~4 min | 2/2 (100%) | 8/10 |
+| v2 | 4 | 3 | ~5.5 min | 3/4 (75%) | 9/10 |
+
+- v2 candidate 3 selected as `figures/system_overview.png` (+ SVG vectorized backup)
+- v2 candidate 2 failed: Gemini Image rendered text as garbled characters (known failure mode for numeric labels)
+- Inserted into `main.tex` with caption, LaTeX compilation passed (11 pages)
+
+### Sync with upstream
+
+```bash
+# Pull upstream changes
+git fetch upstream && git merge upstream/main
+
+# Push to this fork
+git push origin main
+```
+
+---
+
 <div align="center">
 <a href="https://huggingface.co/papers/2601.23265"><img src="assets/paper-page-xl.svg" alt="Paper page on HF"></a>
 <a href="https://huggingface.co/datasets/dwzhu/PaperBananaBench"><img src="assets/dataset-on-hf-xl.svg" alt="Dataset on HF"></a>
